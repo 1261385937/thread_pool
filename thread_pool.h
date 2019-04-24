@@ -132,7 +132,7 @@ namespace thp {
 			std::future<result_type> res(task.get_future());
 			auto task_id = task_id_.load();
 			++task_id_;
-			auto index = task_id % pool_size_;
+			std::size_t index = task_id % pool_size_;
 			queue_groups_[index].enqueue(FunctionWrapper(std::move(task), std::forward<ArgTypes>(args)...));
 			conditions_[index]->notify_one();
 			return res;
