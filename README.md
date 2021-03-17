@@ -1,2 +1,2 @@
 # thread_pool
-lock free thread pool with roundRobin deliver
+lock free thread pool with roundRobin dispatching task
