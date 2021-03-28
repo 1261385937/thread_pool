@@ -5,13 +5,11 @@
 #include <future>
 #include <atomic>
 #include <thread>
-#include <mutex>
-#include <condition_variable>
 #include <algorithm>
 #include <array>
-#include "concurrentqueue.h"
+#include "blockingconcurrentqueue.h"
 
-namespace nc {
+namespace thp {
 	class function_wrapper {
 	private:
 		struct impl_base {
@@ -49,11 +47,11 @@ namespace nc {
 			impl_(std::make_unique<impl_type<F, ArgTypes...>>(std::forward<F>(f), std::forward<ArgTypes>(args)...))
 		{}
 
-		function_wrapper(function_wrapper&& other)
+		function_wrapper(function_wrapper&& other) noexcept
 			:impl_(std::move(other.impl_))
 		{}
 
-		function_wrapper& operator=(function_wrapper&& other)
+		function_wrapper& operator=(function_wrapper&& other) noexcept
 		{
 			impl_ = std::move(other.impl_);
 			return *this;
@@ -66,41 +64,57 @@ namespace nc {
 		function_wrapper& operator=(const function_wrapper&) = delete;
 	};
 
+	enum class work_mode {
+		nosteal,
+		steal
+	};
+
+	template<work_mode WorkMode = work_mode::nosteal>
 	class thread_pool
 	{
 	private:
 		size_t pool_size_;
 		std::atomic_bool run_;
-		std::vector<std::shared_ptr<std::mutex>> mtxs_;
 		std::atomic<uint64_t> task_id_;
-		std::vector<std::shared_ptr<std::condition_variable>> conditions_;
+		std::vector<std::atomic<uint32_t>> tasks_count_;
+		std::vector<std::atomic<uint32_t>> tasks_left_;
 		std::vector<std::thread> threads_;
-		std::vector<moodycamel::ConcurrentQueue<function_wrapper>> queue_groups_;
+		std::vector<moodycamel::BlockingConcurrentQueue<function_wrapper>> queue_groups_;
 	private:
 		void start_thread(size_t index) {
 			function_wrapper task;
 			while (run_) {
-				{
-					//just for notify
-					std::unique_lock<std::mutex> lock(*mtxs_[index]);
-					conditions_[index]->wait(lock,
-						[this, index, &task]() {return queue_groups_[index].try_dequeue(task) || !run_; });
-				}
-				if (run_) {
-					deal_task(task);
+				queue_groups_[index].wait_dequeue(task);
+				tasks_left_[index]--;
+				deal_task(std::move(task));
+
+				if constexpr (WorkMode == work_mode::steal) {
+					if (tasks_left_[index].load() != 0) {
+						continue;
+					}
+					steal(index);
 				}
 			}
-			while (queue_groups_[index].try_dequeue(task)) { // still has untreated task
-				deal_task(task);
+
+			while (queue_groups_[index].try_dequeue(task)) {
+				tasks_left_[index]--;
+				deal_task(std::move(task));
+
+				if constexpr (WorkMode == work_mode::steal) {
+					if (tasks_left_[index].load() != 0) {
+						continue;
+					}
+					steal(index);
+				}
 			}
 		}
 
-		void deal_task(function_wrapper& task) {
+		void deal_task(function_wrapper&& task) {
 			try {
 				task();
 			}
-			catch (const std::exception& e) {
-				std::printf("thread_pool deal_task error: %s\n", e.what());
+			catch (const std::exception&) {
+				//std::printf("thread_pool deal_task error: %s\n", e.what());
 			}
 		}
 
@@ -108,17 +122,21 @@ namespace nc {
 		explicit thread_pool(size_t pool_size = std::thread::hardware_concurrency())
 			:pool_size_(pool_size)
 			, run_(true)
-			, task_id_(0) {
+			, task_id_(0)
+			, tasks_count_(pool_size_)
+			, tasks_left_(pool_size_) {
 			for (size_t i = 0; i < pool_size; ++i) {
-				mtxs_.emplace_back(std::make_shared<std::mutex>());
-				conditions_.emplace_back(std::make_shared<std::condition_variable>());
-				queue_groups_.emplace_back(moodycamel::ConcurrentQueue<function_wrapper>());
+				queue_groups_.emplace_back(moodycamel::BlockingConcurrentQueue<function_wrapper>());
 			}
 
 			//can not put together. multiple thread
 			for (size_t i = 0; i < pool_size; ++i) {
 				threads_.emplace_back(std::thread(&thread_pool::start_thread, this, i));
 			}
+		}
+
+		~thread_pool() {
+			stop();
 		}
 
 		template<typename Function, typename... ArgTypes>
@@ -132,7 +150,8 @@ namespace nc {
 			++task_id_;
 			std::size_t index = task_id % pool_size_;
 			queue_groups_[index].enqueue(function_wrapper(std::move(task), std::forward<ArgTypes>(args)...));
-			conditions_[index]->notify_one();
+			tasks_count_[index]++;
+			tasks_left_[index]++;
 			return res;
 		}
 
@@ -142,21 +161,50 @@ namespace nc {
 			++task_id_;
 			std::size_t index = task_id % pool_size_;
 			queue_groups_[index].enqueue(function_wrapper(std::forward<Function>(f), std::forward<ArgTypes>(args)...));
-			conditions_[index]->notify_one();
-			
+			tasks_count_[index]++;
+			tasks_left_[index]++;
 		}
 
 		void stop() {
 			run_ = false;
-			for (auto& cond : conditions_) {
-				cond->notify_one();
+			//static int count = 0;
+			for (size_t i = 0; i < pool_size_; ++i) {
+				//count += tasks_count_[i];
+				queue_groups_[i].enqueue(function_wrapper(exit_signal));
+				tasks_left_[i]++;
 			}
-
 			for (auto& thread : threads_) {
 				if (thread.joinable())
 					thread.join();
 			}
 			//printf("all work thread exit\n");
+		}
+
+	private:
+		static void exit_signal() {}
+
+		void steal(size_t index) {
+			function_wrapper task;
+			for (size_t i = 0; i < pool_size_; ++i) {
+			again:
+				if (tasks_left_[i].load() == 0) {
+					continue;
+				}
+				auto sucess = queue_groups_[i].try_dequeue(task);
+				if (!sucess) {
+					continue; //steal the next 
+				}
+
+				tasks_left_[i]--;
+				deal_task(std::move(task));
+
+				if (tasks_left_[index].load() == 0) {//self still has no task
+					goto again; //attempt to steal this thread task again 
+				}
+				else { //go back to self
+					break;
+				}
+			}
 		}
 	};
 }
